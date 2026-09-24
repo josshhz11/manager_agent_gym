@@ -56,22 +56,16 @@ discussion).
 #### Fix 1 — NEW-001: preference weight mutated in place
 
 - **Where:** `manager_agent_gym/core/workflow_agents/stakeholder_agent.py:191-274` (`apply_weight_update`), reading via `get_preferences_for_timestep` (lines 177-181).
-- **Root cause:** `get_preferences_for_timestep` returns the stored `PreferenceWeights` object *by reference*. `apply_weight_update` builds `name_to_pref = {p.name: p for p in current.preferences}` — a dict of references into that same object — and mutates `.weight` on those `Preference` instances directly. The new wrapper built afterward (line 262) reuses those same mutated instances, so old and new timeline entries end up sharing objects: editing one retroactively rewrites the "historical" one.
-- **Proposed fix:** replace in-place mutation with `model_copy`, e.g.:
-  ```python
-  # instead of: name_to_pref[name].weight = name_to_pref[name].weight + float(delta)
-  name_to_pref[name] = name_to_pref[name].model_copy(
-      update={"weight": name_to_pref[name].weight + float(delta)}
-  )
-  ```
-  Apply the same pattern across the `delta`/`multiplier`/`absolute`/clamp branches (lines 218-259).
+- **Root cause:** `get_preferences_for_timestep` returns the stored `PreferenceWeights` object *by reference*. `apply_weight_update` builds `name_to_pref = {p.name: p for p in current.preferences}` — a dict of references to the `Preference` instances inside that live timeline entry — and mutates `.weight` on them directly. The `PreferenceWeights(...)` built afterward (line 262) then normalizes those same instances in place via its `model_validator`. The *new* timeline entry is safe (it's stored via `.normalize()`, which copies), but the *earlier* entry `current` was already rewritten: after an update at `t=7`, `_preference_timeline[0]` reads the `t=7` weights.
+- **Fix (implemented):** build `name_to_pref` from `preference.model_copy()` so every in-place mutation downstream (the `delta`/`multiplier`/`absolute`/clamp branches and the validator) lands on copies. One change at the construction site instead of one per branch.
 - **Ergon relevance:** none — nothing to port, this is a pure MA-Gym patch.
-- **Effort:** small, self-contained, ~20 lines in one file.
+- **Effort:** small, self-contained, one file plus a regression test (`tests/test_stakeholder_preference_history.py`).
 
 **How to confirm it is fixed and working (DoD):**
-- [ ] Unit test: create a `StakeholderAgent`, call `apply_weight_update` at `t=0` and again at `t=7` with a delta change; assert `get_preferences_for_timestep(0)` still returns the *original* t=0 weight, not the t=7-mutated value.
-- [ ] Assert `id(self._preference_timeline[0].preferences[i])` differs from `id(self._preference_timeline[7].preferences[i])` after the second update (proves no more shared object references).
-- [ ] Re-run the preference-shift smoke test end-to-end; log "preferences observed by the manager at each timestep" alongside "preferences stored in the timeline at that timestep" and diff them across the full run — they must match at every step, not just the last one.
+- [x] Unit test: `apply_weight_update` at `t=7` (parametrized over `delta`/`multiplier`/`absolute`) leaves `get_preferences_for_timestep(0)` and `(6)` at the original weights. Verified failing before the fix, passing after.
+- [x] Chained updates (`t=3` then `t=7`) preserve every earlier entry.
+- [x] Existing non-integration suite unchanged: 50 passed before and after.
+- [ ] Re-run the preference-shift smoke test end-to-end; log "preferences observed by the manager at each timestep" alongside "preferences stored in the timeline at that timestep" and diff them across the full run — they must match at every step, not just the last one. (Needs the manager observation path traced first; deferred until a scenario run is set up.)
 
 ---
 

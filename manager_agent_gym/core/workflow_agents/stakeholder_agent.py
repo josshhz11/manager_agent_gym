@@ -195,8 +195,11 @@ class StakeholderAgent(StakeholderBase):
         current = self.get_preferences_for_timestep(request.timestep)
         prev_dict = current.get_preference_dict()
 
+        # Work on copies: `current` is the live timeline entry, and the updates
+        # below mutate `.weight` in place (as does PreferenceWeights' validator).
         name_to_pref = {
-            preference.name: preference for preference in current.preferences
+            preference.name: preference.model_copy()
+            for preference in current.preferences
         }
 
         # Handle missing names according to policy
