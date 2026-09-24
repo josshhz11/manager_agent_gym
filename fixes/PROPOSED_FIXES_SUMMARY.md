@@ -57,7 +57,7 @@ discussion).
 
 ### Phase A — Foundational integrity (do first; cheap, isolated, unblocks everything downstream)
 
-**Status:** In progress — Fix 1 complete (unit-verified), Fix 4 not started
+**Status:** In progress — Fix 1 complete (unit-verified), Fix 4 in progress
 
 #### Fix 1 — NEW-001: preference weight mutated in place
 
@@ -90,9 +90,9 @@ discussion).
 
 #### Fix 4 — ML-003/009/011/015: fake completion (independent verification layer)
 
-**Status:** Not started
+**Status:** In progress — verifier built and unit-tested; not yet run on a real run's output
 
-- **Where:** doesn't touch engine internals. Deliberately built as an external layer in `src/eval/`, run as a post-hoc pass over run output — avoids engine surgery and reduces merge-conflict risk against the eventual shared team refactor.
+- **Where:** lives in the parent repo, not this submodule: `src/eval/completion_verifier.py` (tests: `tests/test_completion_verifier.py`). Doesn't touch engine internals. Deliberately built as an external layer, run as a post-hoc pass over run output — avoids engine surgery and reduces merge-conflict risk against the eventual shared team refactor.
 - **Root cause (for context):** `engine.py:639` marks a task `COMPLETED` on `result.success` alone (comment at line 650: "Validation system removed; skip resource validations") — no check that the output is actually adequate.
 - **Proposed fix:**
   1. Cross-check each `COMPLETED` task's `execution_notes`/output text for self-reported non-execution phrases (the ML-011 pattern — `"not_executed"`, `"no input data"`) against the engine's status; flag disagreements.
@@ -102,14 +102,23 @@ discussion).
 
 **How to confirm it is fixed and working (DoD):**
 - [ ] Run the verification layer against at least one real trace with known issues (the ICAAP smoke-test run, or a released 20-workflow trace) and confirm it flags the same class of problem the original audit found (placeholder stubs / `not_executed` mismatches).
-- [ ] Confirm `verified_completion` differs meaningfully from raw `goal_completion_rate` on at least one real run (sanity check it isn't a no-op that always agrees).
-- [ ] Confirm both fields are present in `metrics.json` for every subsequent experiment run per the logging schema.
+- [ ] Confirm `verified_completion_rate` differs meaningfully from raw `goal_completion_rate` on at least one real run (sanity check it isn't a no-op that always agrees).
+- [ ] Confirm both fields are present in `metrics.json` for every subsequent experiment run per the logging schema. (Fields are now defined in `docs/metrics.md`; nothing writes `metrics.json` yet.)
+- [x] Unit tests for each flag, composite exclusion, rate maths and the empty-workflow case, including one built from a real `Workflow.model_dump` to guard against schema drift.
 
 **Summary of Changes Done:**
-- None yet.
+- Added `src/eval/completion_verifier.py`: reads the workflow summary JSON and flags each engine-`COMPLETED` leaf task with `no_assigned_agent`, `never_started`, `no_output_resources`, `empty_output`, `self_reported_non_execution` or `placeholder_content`. Reports `engine_completion_rate`, `verified_completion_rate` and per-flag counts. CLI: `python -m eval.completion_verifier <summary.json>`.
+- Added `tests/test_completion_verifier.py` (16 tests, all passing; the real-schema test runs only when `manager_agent_gym` is importable).
+- Added `verified_completion_rate` and `completion_flags` to the logging schema in `docs/metrics.md`.
+- Added `pythonpath = ["src"]` to the parent `pyproject.toml` pytest config so tests can import `eval`.
+- The tests caught one detector gap while writing (`[Seller Legal Name]` was missed); regex broadened.
 
 **What's left to verify:**
-- All items in the DoD checklist above.
+- Run the CLI on a real run's `workflow_outputs` summary (the ICAAP smoke-test run, or a released trace) and check it flags the kinds of problems the audit reported. Not done: no real run output exists in the repo yet.
+- False-positive rate is unmeasured. The placeholder patterns are keyword heuristics (`[... name ...]`, `TBD`, etc.) and could flag legitimate text.
+- Plain-prose unfilled templates (e.g. "Seller Legal Name" with no brackets) are not detectable by these checks.
+- Nothing calls the verifier from an experiment runner or writes `metrics.json` yet.
+- Only leaf tasks are scored; confirm that matches how `goal_completion_rate` should treat decomposed tasks.
 
 ---
 
