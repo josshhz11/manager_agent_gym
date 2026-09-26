@@ -53,44 +53,46 @@ discussion).
 
 **Status legend:** Not started · In progress · Complete (unit-verified) · Complete (verified end-to-end) · Blocked. Update with `/status-update`.
 
-**Last updated:** 2026-09-24
+**Last updated:** 2026-09-26
 
 ### Phase A — Foundational integrity (do first; cheap, isolated, unblocks everything downstream)
 
-**Status:** In progress — Fix 1 complete (unit-verified), Fix 4 in progress
+**Status:** Complete — Fix 1 verified end-to-end; Fix 4 unit-verified with one real-run check (see its open items)
 
 #### Fix 1 — NEW-001: preference weight mutated in place
 
-**Status:** Complete (unit-verified); end-to-end check outstanding
+**Status:** Complete (verified end-to-end)
 
 - **Where:** `manager_agent_gym/core/workflow_agents/stakeholder_agent.py:191-274` (`apply_weight_update`), reading via `get_preferences_for_timestep` (lines 177-181).
 - **Root cause:** `get_preferences_for_timestep` returns the stored `PreferenceWeights` object *by reference*. `apply_weight_update` builds `name_to_pref = {p.name: p for p in current.preferences}` — a dict of references to the `Preference` instances inside that live timeline entry — and mutates `.weight` on them directly. The `PreferenceWeights(...)` built afterward (line 262) then normalizes those same instances in place via its `model_validator`. The *new* timeline entry is safe (it's stored via `.normalize()`, which copies), but the *earlier* entry `current` was already rewritten: after an update at `t=7`, `_preference_timeline[0]` reads the `t=7` weights.
 - **Fix (implemented):** build `name_to_pref` from `preference.model_copy()` so every in-place mutation downstream (the `delta`/`multiplier`/`absolute`/clamp branches and the validator) lands on copies. One change at the construction site instead of one per branch.
 - **Ergon relevance:** none — nothing to port, this is a pure MA-Gym patch.
-- **Effort:** small, self-contained, one file plus a regression test (`tests/test_stakeholder_preference_history.py`).
+- **Effort:** small, self-contained, one file plus regression tests (`tests/test_stakeholder_preference_history.py`, `tests/test_icaap_preference_shift_history.py`).
 
 **How to confirm it is fixed and working (DoD):**
 - [x] Unit test: `apply_weight_update` at `t=7` (parametrized over `delta`/`multiplier`/`absolute`) leaves `get_preferences_for_timestep(0)` and `(6)` at the original weights. Verified failing before the fix, passing after.
 - [x] Chained updates (`t=3` then `t=7`) preserve every earlier entry.
-- [x] Existing non-integration suite unchanged: 50 passed before and after.
-- [ ] Re-run the preference-shift smoke test end-to-end; log "preferences observed by the manager at each timestep" alongside "preferences stored in the timeline at that timestep" and diff them across the full run — they must match at every step, not just the last one. (Needs the manager observation path traced first; deferred until a scenario run is set up.)
+- [x] Existing non-integration suite unchanged: 50 passed before the fix, all pass after (78 with the new tests).
+- [x] End-to-end: replayed ICAAP's real scripted schedule (`t=0,10,30,60`) through `apply_weight_updates`; every timestep sees the weights scheduled for it. The 20-step ICAAP smoke run also logged the expected weights at each step (initial through `t=9`, shifted from `t=10`). On the original code the same replay fails: `t=0` read `quality=0.286` (the `t=10` value) instead of `0.429`.
+- [x] Invariant test over all 20 registered scenarios with scripted shifts (an update at `T` must not change what any `t<T` sees): all pass with the fix, all 20 fail on the original code.
+- [x] Audited callers of `get_preferences_for_timestep` (engine.py:312 and its uses, `run_examples.py:243`): all read-only, and no other library code mutates a returned timeline entry.
 
 **Summary of Changes Done:**
 - `stakeholder_agent.py` (`apply_weight_update`): `name_to_pref` is now built from `preference.model_copy()`, so in-place mutation no longer rewrites the earlier timeline entry.
 - Added `tests/test_stakeholder_preference_history.py` (5 tests: three update modes, chained updates, `previous_weights`).
-- Confirmed the regression tests fail on the unpatched code (4 failed) and pass after the fix; full non-integration suite unchanged (55 passed, 3 skipped).
+- Added `tests/test_icaap_preference_shift_history.py` (21 tests): replay of ICAAP's scripted schedule, plus the no-earlier-timestep-rewritten invariant across all 20 registered scenarios.
+- Confirmed the tests fail on the original code and pass after the fix; full non-integration suite: 78 passed.
 - Corrected this doc's root-cause description (the earlier timeline entry is the one corrupted, not the new one).
 
 **What's left to verify:**
-- End-to-end check: log what the manager observes vs. what the timeline holds at each step of a run with a real injected shift, and diff them.
-- `get_preferences_for_timestep` still returns the live timeline entry (e.g. via `engine.py:312`); other callers have not been audited for mutating it.
-- The audit says shown-vs-scored weights differ in 16/20 scenarios; not yet confirmed that this fix alone accounts for all of it.
+- Nothing blocking. The manager's prompt text was not inspected directly; the engine passes `get_preferences_for_timestep` output into the manager observation, so it now shows the scheduled weights by construction.
+- The audit measured "shown vs scored `t=0` vector differs in 16/20 scenarios"; our invariant (no earlier timestep rewritten) fails in 20/20 on the original code. These are different measurements, so the numbers are not directly comparable.
 
 ---
 
 #### Fix 4 — ML-003/009/011/015: fake completion (independent verification layer)
 
-**Status:** In progress — verifier built and unit-tested; not yet run on a real run's output
+**Status:** Complete (unit-verified); real-run check partial
 
 - **Where:** lives in the parent repo, not this submodule: `src/eval/completion_verifier.py` (tests: `tests/test_completion_verifier.py`). Doesn't touch engine internals. Deliberately built as an external layer, run as a post-hoc pass over run output — avoids engine surgery and reduces merge-conflict risk against the eventual shared team refactor.
 - **Root cause (for context):** `engine.py:639` marks a task `COMPLETED` on `result.success` alone (comment at line 650: "Validation system removed; skip resource validations") — no check that the output is actually adequate.
@@ -101,23 +103,23 @@ discussion).
 - **Ergon relevance:** none — not addressed there either; this is fully project-owned tooling, independent of platform choice.
 
 **How to confirm it is fixed and working (DoD):**
-- [ ] Run the verification layer against at least one real trace with known issues (the ICAAP smoke-test run, or a released 20-workflow trace) and confirm it flags the same class of problem the original audit found (placeholder stubs / `not_executed` mismatches).
-- [ ] Confirm `verified_completion_rate` differs meaningfully from raw `goal_completion_rate` on at least one real run (sanity check it isn't a no-op that always agrees).
-- [ ] Confirm both fields are present in `metrics.json` for every subsequent experiment run per the logging schema. (Fields are now defined in `docs/metrics.md`; nothing writes `metrics.json` yet.)
-- [x] Unit tests for each flag, composite exclusion, rate maths and the empty-workflow case, including one built from a real `Workflow.model_dump` to guard against schema drift.
+- [~] Real trace: checked on one ICAAP run (random manager, gpt-4o-mini, 20 timesteps, seed 42). It flagged the two unusable deliverables (dummy rows such as `ExamplePD01` / `John Doe`; a blank access-control form) and verified the third (generic but filled in), matching a manual read of all three outputs. Not yet seen flagging `[Date]`-style stubs or `not_executed` bodies on real output, and no released 20-workflow trace has been tried.
+- [x] `verified_completion_rate` differs from raw completion on a real run: engine 3/37 (8.1%) vs verified 1/37 (2.7%) on the ICAAP smoke run.
+- [x] Both fields are written to `metrics.json` per the logging schema: `python -m eval.run_metrics <run_dir> --condition ... --challenge-task ...` produced it for the ICAAP run (`tests/test_run_metrics.py`). No experiment runner calls it automatically yet, because none exists.
+- [x] Unit tests for each flag, the hard/review split, composite exclusion, rate maths, the empty-workflow case and `metrics.json` construction, including one built from a real `Workflow.model_dump` and one using an excerpt of real blank-form output.
 
 **Summary of Changes Done:**
-- Added `src/eval/completion_verifier.py`: reads the workflow summary JSON and flags each engine-`COMPLETED` leaf task with `no_assigned_agent`, `never_started`, `no_output_resources`, `empty_output`, `self_reported_non_execution` or `placeholder_content`. Reports `engine_completion_rate`, `verified_completion_rate` and per-flag counts. CLI: `python -m eval.completion_verifier <summary.json>`.
-- Added `tests/test_completion_verifier.py` (16 tests, all passing; the real-schema test runs only when `manager_agent_gym` is importable).
-- Added `verified_completion_rate` and `completion_flags` to the logging schema in `docs/metrics.md`.
-- Added `pythonpath = ["src"]` to the parent `pyproject.toml` pytest config so tests can import `eval`.
-- The tests caught one detector gap while writing (`[Seller Legal Name]` was missed); regex broadened.
+- Added `src/eval/completion_verifier.py`: reads the workflow summary JSON and checks each engine-`COMPLETED` leaf task. Hard flags (fail verification): `no_assigned_agent`, `never_started`, `no_output_resources`, `empty_output`, `self_reported_non_execution`, `placeholder_content` (brackets, `TBD`, dummy names, "to be populated"), `blank_fields` (bullet labels or table cells with no value). Review flag (reported only): `template_resource`. CLI: `python -m eval.completion_verifier <summary.json>`.
+- Ran it on a real ICAAP run. The first version reported 3/3 verified, but reading the outputs showed two were unusable; added the blank-fields and dummy-data checks and made `template_resource` review-only. Result: engine 3/37 (8.1%), verified 1/37 (2.7%).
+- Added `src/eval/run_metrics.py`: builds and writes `metrics.json` per `docs/metrics.md` (validating `condition`, `challenge_task`, `change_depth`), logging both completion rates. `constraint_violations` is null until Fix 6.
+- Added `tests/test_completion_verifier.py` (25 tests with the engine importable) and `tests/test_run_metrics.py` (6 tests).
+- Updated `docs/metrics.md` (`verified_completion_rate`, `completion_flags`, `completion_review_flags`, the null `constraint_violations`) and added `pythonpath = ["src"]` to the parent pytest config.
 
 **What's left to verify:**
-- Run the CLI on a real run's `workflow_outputs` summary (the ICAAP smoke-test run, or a released trace) and check it flags the kinds of problems the audit reported. Not done: no real run output exists in the repo yet.
-- False-positive rate is unmeasured. The placeholder patterns are keyword heuristics (`[... name ...]`, `TBD`, etc.) and could flag legitimate text.
-- Plain-prose unfilled templates (e.g. "Seller Legal Name" with no brackets) are not detectable by these checks.
-- Nothing calls the verifier from an experiment runner or writes `metrics.json` yet.
+- Only one run (3 completed tasks) has been checked; the flags were tuned on it, so how well they generalize is unknown. Try a longer run or a released trace.
+- False-positive rate of the placeholder and blank-field heuristics is unmeasured.
+- Blanks written in plain prose (not as bullet labels or table cells) are not detected.
+- Nothing calls `run_metrics` automatically; it must be run per experiment until a runner exists.
 - Only leaf tasks are scored; confirm that matches how `goal_completion_rate` should treat decomposed tasks.
 
 ---
