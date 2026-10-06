@@ -664,6 +664,19 @@ class WorkflowExecutionEngine:
                                     }
                                 )
                                 self.workflow.tasks[task_id] = completed_task
+                                # Propagate this task's outputs to every task that depends
+                                # on it, so dependents actually receive predecessor
+                                # artifacts instead of starting with no input (ML-001).
+                                # dependency_task_ids is already expanded to leaf task
+                                # ids by get_ready_tasks() by the time any task can
+                                # complete, so a direct membership check is sufficient.
+                                if resource_ids:
+                                    for other in self.workflow.tasks.values():
+                                        if task_id in other.dependency_task_ids:
+                                            other.input_resource_ids = list(
+                                                set(other.input_resource_ids)
+                                                | set(resource_ids)
+                                            )
                                 # Synchronize embedded subtasks with updated registry to fix inconsistencies
                                 for sync_task in self.workflow.tasks.values():
                                     sync_task.sync_embedded_tasks_with_registry(
