@@ -199,45 +199,61 @@ discussion).
 
 ### Phase C — Statistical/metrics trust (needed before running comparative experiments across seeds/conditions)
 
-**Status:** Not started
+**Status:** Complete — Fix 6 complete (unit-verified on real data); Fix 5 empirically confirmed non-reproducible, mitigated procedurally (no code fix attempted, by design)
 
 #### Fix 5 — ML-092: seed reproducibility
 
-**Status:** Not started
+**Status:** Complete (empirically confirmed; procedural mitigation, not a code fix)
 
 - **Where:** manager/worker LLM calls pass `seed=42` unconditionally (audit cites `llm_interface.py:252` — not independently re-verified this session).
 - **Proposed approach:** don't attempt a general fix first — test empirically. Run the identical scenario+seed twice, diff the action sequences/manager-call counts. If divergent, the pragmatic mitigation is procedural (more seeds, switch to an unpaired significance test) rather than chasing seed-threading through the full provider stack, which is disproportionate to project scope.
 - **Ergon relevance:** none found.
 
 **How to confirm it is fixed and working (DoD):**
-- [ ] Run the identical scenario+seed twice; diff manager action sequences and call counts. Document the outcome either way (identical → fixed; still divergent → documented as a known limitation with the resulting stats-design fallback recorded in `docs/metrics.md`).
-- [ ] If a code-level fix is attempted, confirm near-identical results (or quantify residual variance) across at least 5 repeated runs of the same seed before trusting paired comparisons built on it.
+- [x] Ran the identical scenario+seed twice; diffed manager action sequences and call counts. **Result: divergent, at every level checked.**
+  - Isolated-call level (cheapest, cleanest signal): one structured call (`gpt-4o-mini`, `temperature=0`, `seed=42`, identical prompt, nothing else running concurrently), repeated 5 times. **5 of 5 outputs were different** — including the structured `items` list, not just free-text content expected to vary.
+  - Full-engine level (`marketing_campaign`, random manager, `gpt-4o-mini`, 10 timesteps, `seed=42`, run twice): action sequences were identical for the first 7 steps, then diverged at step 8 (`A: failed_action` vs. `B: send_message`); final task counts differed (52 vs. 53).
+  - Documented the outcome: switched `docs/metrics.md`'s Statistics section from a paired to an **unpaired** significance test (Welch's t-test / Mann-Whitney U), since "same seed" does not mean "same underlying randomness" here — a paired test's correlated-pairs assumption doesn't hold, which risks overstating significance, not just losing power. Logged as `notes/DECISIONS.md` entry `[2026-10-07] Switch significance testing from paired to unpaired; confirm ML-092 empirically`.
+- [x] No code-level fix was attempted, by design (this DoD item only applies if one is) — the divergence originates in the LLM provider's own sampling behavior, not in anything MA-Gym's code controls, so chasing seed-threading through the full provider stack was out of scope from the start.
 
 **Summary of Changes Done:**
-- None yet.
+- No code changes in MA-Gym or the fork — this fix is a measurement plus a project-level statistical-design decision, not a code patch.
+- `docs/metrics.md`: Statistics section rewritten to specify an unpaired test and explain why, with the concrete evidence inline.
+- `notes/DECISIONS.md`: new entry recording the decision, evidence, and alternatives considered.
+- Earlier session note for context: this was blocked for a time on `429 credit_balance_exhausted` — the account's balance had gone negative, which also blocked the data-sharing free daily tier from taking effect. Resolved once the balance was topped up positive; the free tier (2.5M tokens/day for `gpt-4o-mini`-class models) then covered this check's actual usage.
 
 **What's left to verify:**
-- All items in the DoD checklist above.
+- Nothing blocking for this fix itself. Open follow-on work (not part of Fix 5, but a consequence of it): the real baseline-reproduction experiments need a target seed count sized by a power analysis for the now-unpaired test, before they start — not before Fix 5 is considered done.
 
 ---
 
 #### Fix 6 — ML-016/033/034: dead scoring-aggregation formulas
 
-**Status:** Not started
+**Status:** Complete (unit-verified on real data)
 
-- **Where:** `manager_agent_gym/core/evaluation/validation_engine.py` (aggregation dispatch), `constraint_evaluator.py` (dead deterministic `hard_constraints_enforced` per the audit).
-- **Proposed fix (scoped, not a general MA-Gym fix):** write a dedicated aggregation function for exactly the constraint rubrics this project's challenge tasks use; call it directly from `src/eval/` instead of routing through the broken shared weighted-max path; unit-test against a synthetic case with a known expected zero/non-zero outcome.
+- **Where (confirmed this session, current line numbers):** `manager_agent_gym/core/evaluation/validation_engine.py` (~line 212 and ~line 250, preference-level and workflow-level aggregation, duplicated): `if rubrics_for_pref: weighted-by-max ELSE: consult evaluator.aggregation`. Every real evaluator has rubrics, so the `else` branch — the only place a declared `AggregationStrategy` or custom callable actually runs — is unreachable in practice. `constraint_evaluator.py`'s `build_constraint_evaluator()` (used by every real run via `common_evaluators.build_default_evaluators`, called from `examples/run_examples.py`) declares `aggregation=hard_zero_agg` (zero the whole group if `hard_constraints_enforced` scored 0) on an evaluator with 7 rubrics — so that gate never runs, confirmed.
+- **Real-data confirmation, not hypothetical:** on the already-collected ICAAP smoke run, the `hard_constraints_enforced` rubric scored 0.0 (a hard constraint was violated), yet the engine reported `constraint_adherence = 0.0722` (its weighted-by-max formula: `2.889/40`). Under the evaluator's own declared `hard_zero_agg`, this should have been exactly `0.0`.
+- **Fix (implemented):** `src/eval/constraint_aggregation.py` — a standalone re-implementation of MA-Gym's 5 `AggregationStrategy` values (matching its exact math) plus `hard_zero_gate` (re-implementing `hard_zero_agg`'s semantics against rubric data directly, not through the dead dispatch path) and `weighted_by_max` (exposed for comparison, not just silently defaulted to). Deliberately does not patch `validation_engine.py` — same reasoning as Fix 4's external-verifier approach (avoids engine surgery, independent of the platform decision).
 - **Ergon relevance:** Ergon's own audit found the same *shape* of bug (silent zero-scores) — confirms this isn't a MA-Gym-only quirk, but nothing to port; the scoped rubric aggregation sidesteps it either way.
 
 **How to confirm it is fixed and working (DoD):**
-- [ ] Unit test the scoped aggregation function against a synthetic case with a known expected result (e.g. all-zero rubric inputs → `hard_constraints_enforced == 0.0`, not a silent fallback to a different formula).
-- [ ] Confirm `constraint_violations` values on a real run vary meaningfully across conditions expected to differ (not clustered at the previously-observed dead values, e.g. the audit's ~0.43–0.64 shadow range coexisting with a 0.0 hard-constraint score).
+- [x] Unit tests for each built-in strategy against known expected results (`WEIGHTED_AVERAGE`, `MIN`, `MAX`, `PRODUCT`, `HARMONIC_MEAN`, including the harmonic-mean-with-a-zero edge case and the empty-input case for all five), plus `hard_zero_gate` (zeroes on violation, averages otherwise, defaults open when the gate rubric is absent, empty-input case) — 11 tests, `tests/test_constraint_aggregation.py`.
+- [x] Confirmed against real data, not a synthetic case: replayed the exact rubric scores from the real ICAAP run. `weighted_by_max` on that data reproduces the engine's actual reported `0.0722` exactly; `hard_zero_gate` on the same data correctly returns `0.0` — demonstrating the discrepancy concretely rather than asserting it exists.
+- [x] Wired into `src/eval/run_metrics.py` (`compute_constraint_violations`): reads the real `final_evaluation_*.json`, reports `by_rubric_violated`, `violation_count`, `correctly_aggregated_score` (ours) and `engine_reported_score` (MA-Gym's, kept for comparison) — `constraint_violations` in `metrics.json` is no longer hardcoded `null`. Returns `null` only when no evaluation output exists or the named evaluator didn't run at all, never a wrong number. 5 tests in `tests/test_run_metrics.py`, including one building `metrics.json` end-to-end from the real ICAAP rubric data.
+- [ ] "Confirm `constraint_violations` values on a real run vary meaningfully across conditions expected to differ" — not yet checked; no comparative runs (different conditions on the same scenario) exist yet to compare. Will fall out naturally once the actual baseline-comparison experiments run (Phase 1 proper / post-fix work), not something to force here with a throwaway run.
 
 **Summary of Changes Done:**
-- None yet.
+- Added `src/eval/constraint_aggregation.py`: `AggregationStrategy` enum (independent copy, no import-time dependency on the engine), `aggregate()` for the 5 built-ins, `hard_zero_gate()`, `weighted_by_max()`.
+- Added `tests/test_constraint_aggregation.py` (14 tests, including the real-ICAAP-data replay).
+- `src/eval/run_metrics.py`: added `find_final_evaluation` and `compute_constraint_violations`; `build_run_metrics` now calls it instead of hardcoding `None`.
+- Extended `tests/test_run_metrics.py` (+6 tests) to cover the new behavior, including a full `metrics.json` build from real rubric data.
+- While writing the tests, caught two of my own mismatches between the code and its docstring (returning `{}` vs `None` for "evaluator not found" vs "evaluator found but produced no rubrics") and fixed the code to match the intended, documented behavior rather than adjust the tests to paper over it; also caught a manual miscount in one test's expected `violation_count` (counted 5, the real count is 6) and corrected the test, not the code, after re-deriving it by hand.
+- Updated `docs/metrics.md`'s `constraint_violations` schema entry to describe the new shape and scope (currently "by constraint type" means "by rubric name within MA-Gym's built-in `constraint_adherence` evaluator" — this project hasn't defined its own scenario-specific constraints yet).
 
 **What's left to verify:**
-- All items in the DoD checklist above.
+- The "varies meaningfully across conditions" DoD item — needs real comparative runs, which don't exist yet (see above).
+- This only re-aggregates the one built-in `constraint_adherence` evaluator. If/when Phase 2/3 define project-specific constraint rubrics with their own aggregation needs, confirm whether `hard_zero_gate` (or another strategy here) is still the right semantic for them, or whether a new one is needed.
+- `weighted_by_max` itself is not wrong in general — it's a legitimate strategy, just not always the *declared* one. Haven't checked whether any of MA-Gym's other built-in evaluators (`stakeholder_management`, `operational_efficiency`, scenario `goal_achievement`) declare a different strategy than they actually get; scoped this fix to `constraint_adherence` specifically since that's the one `constraint_violations` maps to.
 
 ---
 
