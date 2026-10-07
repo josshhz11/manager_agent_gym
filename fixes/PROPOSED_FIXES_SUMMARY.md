@@ -126,7 +126,7 @@ discussion).
 
 ### Phase B — Coordination substrate (needed before team-churn / compound experiments)
 
-**Status:** In progress — Fix 2 verified end-to-end; Fix 3 not started
+**Status:** Complete — Fix 2 verified end-to-end; Fix 3 unit-verified (real-run/injection-depth check deferred to the team-churn challenge task itself, see Fix 3)
 
 #### Fix 2 — ML-001/ML-002: no real artifact handoff
 
@@ -167,28 +167,33 @@ discussion).
 
 #### Fix 3 — ML-051/052/053: churn/reassignment integrity
 
-**Status:** Not started
+**Status:** Complete (unit-verified); real-run check deferred — see below
 
-- **Where (per audit CSV — line numbers not independently re-verified this session, confirm before implementing):**
-  - Scheduling readiness logic (`is_ready_to_start`-equivalent) — FAILED tasks never re-enter the ready set, no retry path.
-  - `AssignTaskAction.execute` (audit cites `manager_actions.py:131`) — validates only that task/agent ids exist, not whether the task is actually assignable (composite parent, unmet deps, already RUNNING/FAILED/COMPLETED).
-  - Same method — doesn't mutate `self.success`/`self.result_summary` on rejection, so the manager never observes the rejection.
-- **Proposed fix:**
-  1. Add a requeue path: when a task's assigned agent becomes unavailable (the injected "leave" event), transition the task back to READY instead of leaving it permanently FAILED.
-  2. Add real validation to `AssignTaskAction.execute` — reject assigns to composite parents, tasks with unmet dependencies, or non-assignable states, with an actual failure result rather than a silent success.
-  3. Ensure the rejection writes back to `action_result.success`/`result_summary` so the manager's next observation reflects it.
+- **Where (confirmed this session, current line numbers):**
+  - `manager_agent_gym/core/execution/engine.py` (`_check_and_apply_agent_changes`) — pruned a departed agent from `workflow.agents` but never looked at tasks still pointing at it; `_execute_ready_tasks` only starts a task if `workflow.agents.get(task.assigned_agent_id)` resolves, so an orphaned task just sat at READY forever with no retry (ML-051).
+  - `manager_agent_gym/schemas/execution/manager_actions.py` (`AssignTaskAction.execute`, confirmed at line 131) — validated only that the task id and agent id exist, not whether the task was actually assignable (composite parent, unmet dependencies, already RUNNING/COMPLETED/FAILED) (ML-052).
+  - **ML-053 does not reproduce on the current code.** Checked directly rather than assumed: `on_action_executed`'s default implementation builds the manager's recorded action brief from `action_result.success` (the returned `ActionResult`), not from the action instance's own `.success` field — and nothing in `manager_agent/*.py` or `engine.py` reads that instance field at all. A test driving a manager that repeatedly makes an already-rejected assignment (agent id that doesn't exist) shows it seeing every rejection via `action_result`, on unfixed code. Not fixed, because nothing here is broken.
+- **Fix (implemented):**
+  1. `_check_and_apply_agent_changes`: after pruning departed agents, sweep every PENDING/READY task whose `assigned_agent_id` is no longer in `workflow.agents` and clear it, so the manager can reassign it.
+  2. `AssignTaskAction.execute`: reject (with a real failure `ActionResult`, not a silent success) assignments to composite tasks, tasks not in `(PENDING, READY)`, or tasks whose dependencies aren't actually satisfied (`is_ready_to_start`).
 - **Ergon relevance:** none found — no join/leave/reassignment handling documented in Ergon either. Fully project-owned; a good candidate to raise in the shared-refactor requirements doc given the other three students likely hit the same gap.
 
 **How to confirm it is fixed and working (DoD):**
-- [ ] Inject a synthetic "worker leaves mid-task" event in a test scenario; assert the task transitions back to READY (not permanently FAILED) and is picked up by a remaining/new worker within a bounded number of timesteps.
-- [ ] Confirm `AssignTaskAction.execute` now returns `success=False` for an invalid assign (e.g. targeting a composite parent or an already-COMPLETED task), and that this is visible in the manager's next observation (not silently dropped).
-- [ ] Run the team-churn challenge task end-to-end at each injection depth (25/50/75%) and confirm no task is left permanently orphaned at episode end.
+- [x] Synthetic "worker leaves mid-task" reproduction: a task pre-assigned to an agent not present in `workflow.agents` stays stuck at READY forever on the original code, with a manager that correctly leaves already-assigned tasks alone (ruling out the manager's own reassignment behavior as what fixes it); with the fix, it's requeued and completes on a backup worker (`tests/test_churn_reassignment.py`).
+- [x] `AssignTaskAction.execute` now returns `success=False` for a composite task, a task with unmet dependencies, and an already-completed task (3 tests), while a normal valid assignment still succeeds (1 sanity test) — all 4 fail/pass correctly before/after the fix.
+- [x] Confirmed the manager does see rejections via `action_result` — both before this fix (using an always-existing rejection path) and unaffected by it.
+- [ ] Run the team-churn challenge task end-to-end at each injection depth (25/50/75%) and confirm no task is left permanently orphaned. **Deferred, not skipped:** checked whether any shipped scenario naturally exercises a worker leaving — none do; all 20 registered scenarios' team timelines are `"add"`-only. Per `docs/challenge-tasks.md`, injecting a controlled join/leave event at chosen depths *is* the team-churn challenge task itself (Phase 2+ scope), not a one-off harness to build just for this bug-fix session — building a throwaway version now would duplicate that real work. The engine-level tests above exercise the exact same code paths a real injected run would hit.
 
 **Summary of Changes Done:**
-- None yet. Audit line numbers for `AssignTaskAction` still need re-verifying before implementing.
+- `engine.py` (`_check_and_apply_agent_changes`): added an orphaned-assignment sweep clearing `assigned_agent_id` on any not-yet-started task whose assigned agent is gone.
+- `manager_actions.py` (`AssignTaskAction.execute`): added composite/status/dependency validation before accepting an assignment.
+- Added `tests/test_churn_reassignment.py` (6 tests). While writing the rejection-visibility test, caught and corrected two things: (1) my first version of the departed-worker test was masked by the test manager blindly reassigning every tick regardless of current assignment — fixed the manager to skip already-assigned tasks, which properly isolated the engine-level bug; (2) the rejection-visibility test can't use "assign to a completed task" as its rejection source, since that rejection doesn't exist until fix (b) is applied — switched it to "assign to a nonexistent agent," which already rejects on unfixed code, making it a true independent check of claim (c).
+- Confirmed claim (c) (rejections hidden from the manager) does not reproduce — corrected the plan's earlier description of it rather than implement an unneeded fix.
+- Full suite: 89 passed (2 unrelated pre-existing live-API test failures against `gpt-5`/`gpt-4.1`, confirmed present on the original code too, nothing to do with this fix).
 
 **What's left to verify:**
-- All items in the DoD checklist above.
+- The real-run/injection-depth DoD item above, once the team-churn challenge task's injection harness exists (Phase 2+).
+- Only not-yet-started (PENDING/READY) tasks are requeued when an agent departs; a task already RUNNING when its agent leaves is unaffected by this fix (the asyncio task already holds a direct reference to the agent object and runs to completion regardless of registry/workflow.agents state) — not tested, and worth deciding whether that's the desired behavior for the team-churn task's "leave mid-task" framing specifically.
 
 ---
 
