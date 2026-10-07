@@ -1072,6 +1072,23 @@ class WorkflowExecutionEngine:
 
             # 3) Commit mirrored set to current for next timestep
             self._registry_mirrored_agent_ids = current_registry_ids
+
+            # 4) Requeue any not-yet-started task assigned to an agent that is
+            # no longer present (e.g. it left mid-assignment) so the manager
+            # can reassign it, instead of it being silently stuck forever
+            # (ML-051): _execute_ready_tasks only starts a task if its
+            # assigned_agent_id resolves in self.workflow.agents.
+            for orphan_task in self.workflow.tasks.values():
+                if (
+                    orphan_task.status in (TaskStatus.PENDING, TaskStatus.READY)
+                    and orphan_task.assigned_agent_id is not None
+                    and orphan_task.assigned_agent_id not in self.workflow.agents
+                ):
+                    changes.append(
+                        f"Requeued task {orphan_task.id} (was assigned to "
+                        f"departed agent {orphan_task.assigned_agent_id})"
+                    )
+                    orphan_task.assigned_agent_id = None
         except Exception:
             logger.error(
                 "failed to sync agent registry into workflow agents", exc_info=True

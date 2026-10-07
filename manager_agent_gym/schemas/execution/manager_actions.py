@@ -155,6 +155,35 @@ class AssignTaskAction(BaseManagerAction):
                 success=False,
             )
 
+        target_task = workflow.tasks[task_uuid]
+        if target_task.is_composite_task():
+            return ActionResult(
+                summary=f"Failed: Task {self.task_id} is a composite task and cannot be assigned directly; assign its subtasks instead.",
+                kind="failed_action",
+                data={},
+                action_type=self.action_type,
+                success=False,
+            )
+        if target_task.status not in (TaskStatus.PENDING, TaskStatus.READY):
+            return ActionResult(
+                summary=f"Failed: Task {self.task_id} is {target_task.status.value} and cannot be (re)assigned.",
+                kind="failed_action",
+                data={},
+                action_type=self.action_type,
+                success=False,
+            )
+        completed_task_ids = {
+            tid for tid, t in workflow.tasks.items() if t.status == TaskStatus.COMPLETED
+        }
+        if not target_task.is_ready_to_start(completed_task_ids):
+            return ActionResult(
+                summary=f"Failed: Task {self.task_id} has unmet dependencies and is not ready to start.",
+                kind="failed_action",
+                data={},
+                action_type=self.action_type,
+                success=False,
+            )
+
         # Execute assignment
         workflow.tasks[task_uuid].assigned_agent_id = self.agent_id
         logger.info(f"Task {self.task_id} assigned to agent {self.agent_id}")
